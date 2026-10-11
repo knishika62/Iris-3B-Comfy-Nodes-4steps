@@ -86,6 +86,7 @@ The text encoder has to be the original HF folder. Single-file or fp8 Qwen3-VL t
 
 - **Load Iris-3B Model**: loads the DiT. `bf16` uses 6 GB of VRAM. `fp32` is the shipped precision but needs a lot more than 16 GB. Optional `turbo_lora` and `lora_strength` merge a Turbo adapter from `models/loras` into the weights at load time.
 - **Load Iris Turbo LoRA**: merge a Turbo adapter into an already loaded model, so one model load covers several adapters. The weights change in place, so connect this node's output, not the loader's.
+- **Load Iris LoRA (ai-toolkit)**: merge a LoRA trained with [ai-toolkit](https://github.com/ostris/ai-toolkit) (`arch: iris3b`) into a loaded model, read directly: its PEFT keys (`diffusion_model.*.lora_A/lora_B.weight`) are renamed on load, the rank is inferred, and strength 1.0 matches the trained strength (ai-toolkit trains with alpha = rank). Drop the `<name>_LoRA_<step>.safetensors` file in `models/loras` (subfolders included) and it's listed. Layers this Iris model lacks are skipped with a warning. Merge it before any Turbo LoRA: like the Turbo merge it is permanent.
 - **Load Iris Text Encoder (Qwen3-VL-4B)**: lists HF folders in `text_encoders`.
 - **Iris Text Encode**: positive and negative prompt. Leave the negative empty to use the null prompt the model was trained with.
 - **Iris Turbo Sampler (4 steps)**: the few-step sampler for a model loaded with a Turbo LoRA. Mode, resolution, image strength, seed and batch size, no steps or cfg: those come from the adapter's own metadata (4 steps, shift 4, guidance baked in).

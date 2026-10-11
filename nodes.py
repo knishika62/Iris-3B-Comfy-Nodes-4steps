@@ -32,6 +32,7 @@ import dataclasses
 import gc
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -217,6 +218,31 @@ def _is_turbo_adapter(path: Path) -> bool:
         return False
 
 
+def _is_aitoolkit_lora(path: Path) -> bool:
+    """An ai-toolkit LoRA (arch: iris3b): PEFT keys, no rank/alpha metadata."""
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            keys = f.keys()
+            meta = f.metadata() or {}
+        return "rank" not in meta and any(_PEFT_KEY.match(k) for k in keys)
+    except Exception:
+        return False
+
+
+def _aitoolkit_lora_files() -> list[str]:
+    """ai-toolkit LoRAs in models/loras, subfolders included."""
+    out: list[str] = []
+    for root in folder_paths.get_folder_paths("loras"):
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.safetensors")):
+            name = str(path.relative_to(base)).replace(os.sep, "/")
+            if _is_aitoolkit_lora(path):
+                out.append(name)
+    return out
+
+
 def _lora_path(name: str) -> str:
     """Full path of a listed LoRA; a missing stock Turbo adapter is fetched first."""
     path = folder_paths.get_full_path("loras", name)
@@ -234,6 +260,71 @@ def turbo_times(steps: int, shift: float) -> list[float]:
     fork's distill.turbo_times: sigma = 1 - i/steps remapped by the shift."""
     grid = 1.0 - torch.arange(steps, dtype=torch.float64) / steps
     return shift_sigma(grid, shift).tolist()
+
+
+# ai-toolkit (arch: iris3b) saves its LoRAs in PEFT format with a comfy prefix:
+# "diffusion_model.<layer>.lora_A.weight" / ".lora_B.weight", with ss_* metadata but
+# no rank/alpha. The keys name the same DiT Linears, so they only need renaming.
+_PEFT_KEY = re.compile(r"^(?:diffusion_model|transformer)\.(.+?)\.lora_([AB])\.weight$")
+
+
+def _read_aitoolkit_lora(dit: IrisDiT, path: str, name: str) -> tuple[dict, int]:
+    """Read an ai-toolkit LoRA for Iris-3b: PEFT keys renamed to the Iris layout,
+    rank inferred from the tensors. Returns (tensors, rank); layers this Iris
+    model lacks are skipped with a warning."""
+    tensors = load_file(path)
+    renamed = {}
+    for key, tensor in tensors.items():
+        match = _PEFT_KEY.match(key)
+        if match:
+            suffix = "lora_down" if match.group(2) == "A" else "lora_up"
+            renamed[f"{match.group(1)}.{suffix}"] = tensor
+    if not renamed:
+        raise ValueError(f"{name} has no PEFT LoRA keys: not an ai-toolkit LoRA")
+    ranks = {t.shape[0] for key, t in renamed.items() if key.endswith(".lora_down")}
+    if len(ranks) > 1:
+        raise ValueError(f"{name} has mismatched ranks {sorted(ranks)}: convert it by hand")
+    layers = {}
+    skipped = 0
+    for key in renamed:
+        if not key.endswith(".lora_down"):
+            continue
+        prefix = key[: -len(".lora_down")]
+        try:
+            linear = dit.get_submodule(prefix)
+        except AttributeError:
+            skipped += 1  # layers this Iris config lacks (text adapter, pixel head, ...)
+            continue
+        if not isinstance(linear, torch.nn.Linear):
+            raise ValueError(f"{name}: {prefix} is not a Linear layer")
+        layers[key] = renamed[key]
+        layers[prefix + ".lora_up"] = renamed[prefix + ".lora_up"]
+    if not layers:
+        raise ValueError(f"{name}: none of its {len(renamed) // 2} layers exist in this Iris model")
+    if skipped:
+        log.warning("%s: %d layers skipped, this Iris model lacks them", name, skipped)
+    return layers, ranks.pop()
+
+
+def _merge_aitoolkit_lora(model: IrisDiT, name: str, strength: float) -> None:
+    """Fold an ai-toolkit LoRA into the model's Linear weights, in place."""
+    tensors, rank = _read_aitoolkit_lora(model, _lora_path(name), name)
+    # ai-toolkit forces peft format for transformer models, which trains with
+    # alpha = rank (the alpha buffer is not saved), so strength is the whole scale.
+    scale = strength
+    for key in tensors:
+        if not key.endswith(".lora_down"):
+            continue
+        prefix = key[: -len(".lora_down")]
+        linear = model.get_submodule(prefix)
+        down = tensors[key].to(linear.weight.device, torch.float32)
+        up = tensors[prefix + ".lora_up"].to(linear.weight.device, torch.float32)
+        if up.abs().max() == 0:
+            continue
+        merged = linear.weight.float() + scale * (up @ down)
+        linear.weight.copy_(merged.to(linear.weight.dtype))
+    log.info("merged ai-toolkit LoRA %s: %d layers, rank %d at strength %g",
+             name, len(tensors) // 2, rank, strength)
 
 
 def _merge_turbo_lora(model: IrisDiT, name: str, strength: float) -> dict:
@@ -350,6 +441,38 @@ class IrisTurboLoRALoader:
         model.turbo = _merge_turbo_lora(model.model, lora_name, strength)
         model.turbo.setdefault("steps", 4)
         model.turbo.setdefault("shift", 4.0)
+        return (model,)
+
+
+class IrisAIToolkitLoRA:
+    """Merge an ai-toolkit LoRA (arch: iris3b) into a loaded model, read directly:
+    its PEFT keys are renamed on load and the rank is inferred, no conversion step.
+    Merge it before any Turbo LoRA: like the Turbo merge it is permanent."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("IRIS_MODEL",),
+                "lora_name": (_aitoolkit_lora_files(), {
+                    "tooltip": "an ai-toolkit LoRA (arch: iris3b) in models/loras, subfolders "
+                               "included, saved as <name>_LoRA_<step>.safetensors"},),
+                "strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 3.0, "step": 0.05,
+                                       "tooltip": "1.0 matches the trained strength "
+                                                  "(ai-toolkit trains with alpha = rank)"}),
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    def load(self, model, lora_name, strength):
+        if model.turbo:
+            raise ValueError(
+                "this model already has a Turbo LoRA merged in: merge the ai-toolkit LoRA first, "
+                "then the Turbo one, or load the base model again.")
+        _merge_aitoolkit_lora(model.model, lora_name, strength)
         return (model,)
 
 
@@ -1179,6 +1302,7 @@ def _preview(x0: torch.Tensor):
 NODE_CLASS_MAPPINGS = {
     "IrisModelLoader": IrisModelLoader,
     "IrisTurboLoRALoader": IrisTurboLoRALoader,
+    "IrisAIToolkitLoRA": IrisAIToolkitLoRA,
     "IrisTextEncoderLoader": IrisTextEncoderLoader,
     "IrisTextEncode": IrisTextEncode,
     "IrisTurboSampler": IrisTurboSampler,
@@ -1194,6 +1318,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "IrisModelLoader": "Load Iris-3B Model",
     "IrisTurboLoRALoader": "Load Iris Turbo LoRA",
+    "IrisAIToolkitLoRA": "Load Iris LoRA (ai-toolkit)",
     "IrisTextEncoderLoader": "Load Iris Text Encoder (Qwen3-VL-4B)",
     "IrisTextEncode": "Iris Text Encode",
     "IrisTurboSampler": "Iris Turbo Sampler (4 steps)",
