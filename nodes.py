@@ -1,0 +1,1207 @@
+"""ComfyUI nodes for Iris-3B (speridlabs/iris-3b), a pixel-space text-to-image DiT.
+
+This pack also runs the 4-step Turbo LoRAs (pentacoxian-dev/iris-3b-turbo-lora):
+the adapter is folded into the base weights at load time and the Iris Turbo
+Sampler does 4 forwards with re-noising between steps, no CFG pass. LoRAs come
+from models/loras like any other ComfyUI LoRA, subfolders included.
+
+Iris has no VAE: the sampler denoises RGB pixels directly and returns an IMAGE.
+Its text encoder is the language stack of Qwen3-VL-4B-Instruct (12 hidden layers
+are stacked), so it needs the original Hugging Face folder rather than a
+ComfyUI single-file text encoder. The 4x upscaler is Iris fine-tuned for
+restoration: one forward pass per 1024 px tile, conditioned on a stored empty
+prompt, so it needs no text encoder.
+
+Every model lives in system RAM between runs and only visits the GPU for its
+own step, so they never share VRAM with each other. Any ComfyUI-managed models
+are asked to make room first.
+
+Default files, downloaded from the Hub on first use when missing:
+
+    models/diffusion_models/iris-3b.safetensors            text to image
+    models/diffusion_models/iris-3b-upscaler.safetensors   4x upscaler
+    models/diffusion_models/iris-3b-depth.safetensors      monocular depth
+    models/text_encoders/Qwen3-VL-4B-Instruct/             whole HF repo
+
+The configs come with this pack; the upscaler's and depth model's empty-prompt
+embeddings (36 MB each) are fetched next to them on first use. A
+Hub-layout folder (model.safetensors next to config.yaml) also works.
+"""
+
+import dataclasses
+import gc
+import logging
+import os
+import shutil
+from pathlib import Path
+
+import torch
+from omegaconf import OmegaConf
+from safetensors import safe_open
+from safetensors.torch import load_file
+
+import comfy.model_management as mm
+import comfy.utils
+import folder_paths
+
+from iris3b.config import inference_config
+from iris3b.flow.schedule import shift_sigma
+from iris3b.flow.solver import FlowDPMSolver
+from iris3b.lora import merge_lora_file, read_metadata
+from iris3b.models.dit import IrisDiT
+from iris3b.text.base import TextEncoding
+from iris3b.text.qwen3_vl import Qwen3VLTextEncoder
+
+log = logging.getLogger("ComfyUI-Iris3B")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIGS = os.path.join(HERE, "configs")
+NULL_CACHE_DIR = os.path.join(HERE, "cache")
+GB = 1024**3
+
+IRIS_REPO = "speridlabs/iris-3b"
+TURBO_REPO = "pentacoxian-dev/iris-3b-turbo-lora"
+TEXT_ENCODER_REPO = "Qwen/Qwen3-VL-4B-Instruct"
+TEXT_ENCODER_DIR = "Qwen3-VL-4B-Instruct"
+HF = "https://huggingface.co"
+
+# the released 4-step adapters, offered under these names and downloaded into
+# models/loras on first use when missing; the first is the manifest's default
+TURBO_LORAS = {
+    "iris-3b-turbo-r2-1000.safetensors": "r2-1000/student.safetensors",
+    "iris-3b-turbo-r1-1500.safetensors": "r1-1500/student.safetensors",
+}
+
+# default file name -> (Hub file, bundled config)
+T2I_FILE = "iris-3b.safetensors"
+UPSCALER_FILE = "iris-3b-upscaler.safetensors"
+DEPTH_FILE = "iris-3b-depth.safetensors"
+STOCK = {
+    T2I_FILE: ("model.safetensors", "iris-3b.yaml"),
+    UPSCALER_FILE: ("upscaler/model.safetensors", "iris-3b-upscaler.yaml"),
+    DEPTH_FILE: ("depth/model.safetensors", "iris-3b-depth.yaml"),
+}
+
+
+def hub_url(path: str, repo: str = IRIS_REPO) -> str:
+    return f"{HF}/{repo}/resolve/main/{path}"
+
+
+def _empty_cache() -> None:
+    gc.collect()
+    mm.soft_empty_cache()
+
+
+def _iris_files(kind: str) -> list[str]:
+    """Iris weights in diffusion_models (names with "iris" in them) of one kind:
+    "t2i", "upscaler" or "depth"."""
+    out = []
+    for name in folder_paths.get_filename_list("diffusion_models"):
+        low = name.lower().replace("\\", "/")
+        if "iris" not in low or "empty_prompt" in low:
+            continue
+        found = "upscaler" if "upscaler" in low else "depth" if "depth" in low else "t2i"
+        if found == kind:
+            out.append(name)
+    return out
+
+
+def _with_default(found: list[str], default: str) -> list[str]:
+    # the default is listed only once it exists, so the frontend's missing-model
+    # check can offer the download; VALIDATE_INPUTS still lets a missing default
+    # through and the loader fetches it
+    return [default] + [f for f in found if f != default] if default in found else found
+
+
+def _fetch(repo: str, path: str, target: str) -> str:
+    """Download one Hub file to ``target`` (any name)."""
+    from huggingface_hub import hf_hub_download
+
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    staging = os.path.join(os.path.dirname(target), ".iris-download")
+    log.info("downloading %s/%s to %s", repo, path, target)
+    got = hf_hub_download(repo, path, local_dir=staging)
+    shutil.move(got, target)
+    shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def _weights_path(name: str) -> str:
+    path = folder_paths.get_full_path("diffusion_models", name)
+    if path:
+        return path
+    if name not in STOCK:
+        raise FileNotFoundError(f"{name} not found in models/diffusion_models")
+    target = os.path.join(folder_paths.get_folder_paths("diffusion_models")[0], name)
+    return _fetch(IRIS_REPO, STOCK[name][0], target)
+
+
+def _config_path(weights: str, fallback: str) -> str:
+    """config.yaml next to Hub-layout weights, else the bundled one."""
+    side = os.path.join(os.path.dirname(weights), "config.yaml")
+    if os.path.basename(weights) == "model.safetensors" and os.path.isfile(side):
+        return side
+    return os.path.join(CONFIGS, fallback)
+
+
+def _text_encoder_dir(name: str) -> str:
+    for root in folder_paths.get_folder_paths("text_encoders"):
+        path = os.path.join(root, name)
+        if os.path.isfile(os.path.join(path, "config.json")) and os.path.isfile(
+            os.path.join(path, "model.safetensors.index.json")
+        ):
+            return path
+    if name != TEXT_ENCODER_DIR:
+        raise FileNotFoundError(
+            f"text encoder folder '{name}' not found in models/text_encoders. It must be the whole "
+            f"{TEXT_ENCODER_REPO} repo"
+        )
+    from huggingface_hub import snapshot_download
+
+    target = os.path.join(folder_paths.get_folder_paths("text_encoders")[0], name)
+    log.info("downloading %s to %s (8.3 GB)", TEXT_ENCODER_REPO, target)
+    snapshot_download(TEXT_ENCODER_REPO, local_dir=target)
+    return target
+
+
+def _load_weights(path: str, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    # cast tensor by tensor so an fp32 file never sits in RAM whole
+    with safe_open(path, framework="pt", device="cpu") as f:
+        return {key: f.get_tensor(key).to(dtype) for key in f.keys()}
+
+
+def _build_dit(weights_path: str, config_path: str, dtype: torch.dtype) -> tuple[IrisDiT, object, dict | None]:
+    raw = OmegaConf.to_container(OmegaConf.load(config_path))
+    task = raw.pop("task", None)
+    cfg = inference_config(raw)
+    weights = _load_weights(weights_path, dtype)
+    with torch.device("meta"):
+        model = IrisDiT(cfg.model)
+    model.load_state_dict(weights, strict=True, assign=True)
+    del weights
+    return model.train(False).requires_grad_(False).to(dtype=dtype), cfg, task
+
+
+# --- Turbo LoRA (pentacoxian-dev/iris-3b-turbo-lora) -------------------------
+#
+# An adapter is a plain DMD2-distillation LoRA (up/down pairs keyed
+# "<module>.lora_up" / ".lora_down"), so it sits in models/loras like any other
+# LoRA and is folded into the base weights at load time. Its safetensors
+# metadata carries turbo_steps, shift and resolution; the Iris Turbo Sampler
+# reads them and runs that few-step schedule instead of DPM-Solver++. Guidance
+# is baked into the adapter, so no CFG pass is needed.
+
+def _lora_files() -> list[str]:
+    """Iris Turbo LoRAs in models/loras, subfolders included. A file is one when
+    its safetensors header carries the adapter metadata, so any other LoRA that
+    happens to sit there is not offered. Stock adapters are offered by their
+    default name even before they exist, so the loader can fetch them."""
+    out: list[str] = list(TURBO_LORAS)
+    for root in folder_paths.get_folder_paths("loras"):
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.safetensors")):
+            name = str(path.relative_to(base)).replace(os.sep, "/")
+            if name not in out and _is_turbo_adapter(path):
+                out.append(name)
+    return out
+
+
+def _is_turbo_adapter(path: Path) -> bool:
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            meta = f.metadata() or {}
+        return "rank" in meta and "alpha" in meta and "turbo_steps" in meta.get("extra", "")
+    except Exception:
+        return False
+
+
+def _lora_path(name: str) -> str:
+    """Full path of a listed LoRA; a missing stock Turbo adapter is fetched first."""
+    path = folder_paths.get_full_path("loras", name)
+    if path:
+        return path
+    hub = TURBO_LORAS.get(name)
+    if hub is None:
+        raise FileNotFoundError(f"{name} not found in models/loras")
+    target = os.path.join(folder_paths.get_folder_paths("loras")[0], name)
+    return _fetch(TURBO_REPO, hub, target)
+
+
+def turbo_times(steps: int, shift: float) -> list[float]:
+    """Turbo evaluation times, descending from pure noise (t = 1), as in the
+    fork's distill.turbo_times: sigma = 1 - i/steps remapped by the shift."""
+    grid = 1.0 - torch.arange(steps, dtype=torch.float64) / steps
+    return shift_sigma(grid, shift).tolist()
+
+
+def _merge_turbo_lora(model: IrisDiT, name: str, strength: float) -> dict:
+    """Fold a Turbo adapter into the model's Linear weights; returns its metadata."""
+    meta = merge_lora_file(model, _lora_path(name), strength)
+    if meta.get("turbo_steps"):
+        log.info("merged %s: %s-step turbo adapter (rank %s, alpha %s, shift %s)",
+                 name, meta["turbo_steps"], meta["rank"], meta["alpha"], meta.get("shift"))
+    else:
+        log.warning("%s has no turbo metadata; the Iris Turbo Sampler will fall back to 4 steps "
+                    "and shift 4", name)
+    return meta
+
+
+def _nbytes(module: torch.nn.Module) -> int:
+    return sum(p.numel() * p.element_size() for p in module.parameters())
+
+
+DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
+DTYPE_INPUT = (list(DTYPES), {
+    "default": "bf16",
+    "tooltip": "bf16 = 6 GB on the GPU. fp32 = 12 GB (the shipped precision) and needs well over 16 GB VRAM",
+})
+
+
+class IrisModel:
+    def __init__(self, model: IrisDiT, cfg, dtype: torch.dtype, name: str, turbo: dict | None = None):
+        self.model, self.cfg, self.dtype, self.name = model, cfg, dtype, name
+        self.turbo = turbo
+        self.nbytes = _nbytes(model)
+
+
+class IrisTextEncoder:
+    def __init__(self, encoder: Qwen3VLTextEncoder):
+        self.encoder = encoder
+        self.nbytes = _nbytes(encoder.decoder)
+
+
+class IrisModelLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (_with_default(_iris_files("t2i"), T2I_FILE), {
+                    "tooltip": f"Iris-3B weights in models/diffusion_models. {T2I_FILE} is downloaded "
+                               "on first use if missing (12 GB)",
+                }),
+                "weight_dtype": DTYPE_INPUT,
+            },
+            "optional": {
+                "turbo_lora": (["none"] + _lora_files(), {
+                    "tooltip": "optional Iris Turbo LoRA from models/loras (the stock r2-1000 and "
+                               "r1-1500 are downloaded on first use). It is merged into the weights, "
+                               "then run with the Iris Turbo Sampler for 4-step generation",
+                }),
+                "lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                            "tooltip": "adapter strength. Below 1 drifts away from the "
+                                                       "distilled few-step behaviour; 1 is what it was trained with"}),
+            },
+        }
+
+    RETURN_TYPES = ("IRIS_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, model_name, turbo_lora="none"):
+        return True  # a missing default is downloaded by load()
+
+    def load(self, model_name, weight_dtype, turbo_lora="none", lora_strength=1.0):
+        weights = _weights_path(model_name)
+        model, cfg, task = _build_dit(weights, _config_path(weights, STOCK[T2I_FILE][1]), DTYPES[weight_dtype])
+        if task is not None:
+            raise ValueError(f"{model_name} is an Iris {task['name']} model, not the text-to-image one")
+        turbo = None
+        if turbo_lora != "none":
+            turbo = _merge_turbo_lora(model, turbo_lora, lora_strength)
+            turbo.setdefault("steps", 4)
+            turbo.setdefault("shift", 4.0)
+        log.info("loaded %s as %s%s", model_name, weight_dtype,
+                 f" + {turbo_lora}" if turbo else "")
+        return (IrisModel(model, cfg, DTYPES[weight_dtype], model_name, turbo),)
+
+
+class IrisTurboLoRALoader:
+    """Merge a Turbo LoRA into an already loaded model, so one model load can be
+    reused while trying adapters. The weights are modified in place and the
+    metadata is attached to the model, so connect this node's output, not the
+    loader's, to the Iris Turbo Sampler."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("IRIS_MODEL",),
+                "lora_name": (_lora_files(), {
+                    "tooltip": "Iris Turbo LoRAs in models/loras, subfolders included. r2-1000 and "
+                               "r1-1500 are downloaded there on first use if missing (460 MB each)",
+                }),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                       "tooltip": "1 is the distilled strength"}),
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    def load(self, model, lora_name, strength):
+        if model.turbo:
+            raise ValueError(
+                "this model already has a Turbo LoRA merged in and the merge cannot be undone. "
+                "Load the base model again (its weights reload from disk) before switching adapters.")
+        model.turbo = _merge_turbo_lora(model.model, lora_name, strength)
+        model.turbo.setdefault("steps", 4)
+        model.turbo.setdefault("shift", 4.0)
+        return (model,)
+
+
+class IrisTextEncoderLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        found = []
+        for root in folder_paths.get_folder_paths("text_encoders"):
+            if os.path.isdir(root):
+                found += [d for d in sorted(os.listdir(root))
+                          if d not in found and os.path.isfile(os.path.join(root, d, "config.json"))]
+        qwen = [d for d in found if "qwen3-vl-4b" in d.lower()]
+        names = [TEXT_ENCODER_DIR] + [d for d in qwen + found if d != TEXT_ENCODER_DIR]
+        return {
+            "required": {
+                "encoder_folder": (list(dict.fromkeys(names)), {
+                    "tooltip": "Hugging Face folder of Qwen/Qwen3-VL-4B-Instruct in models/text_encoders. "
+                               "Downloaded on first use if missing (8.3 GB)",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_TEXT_ENCODER",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    def load(self, encoder_folder):
+        path = _text_encoder_dir(encoder_folder)
+        raw = OmegaConf.to_container(OmegaConf.load(os.path.join(CONFIGS, STOCK[T2I_FILE][1])))
+        cfg = dataclasses.replace(inference_config(raw).text_encoder, pretrained=path, null_embed_dir=NULL_CACHE_DIR)
+        encoder = Qwen3VLTextEncoder(cfg, device="cpu")
+        # upstream names the null-embedding cache after cfg.pretrained, which is a
+        # full path here (on Windows its ':' would land in an NTFS stream); use the folder name
+        cache = Path(NULL_CACHE_DIR) / f"null_embed_{encoder_folder}_{cfg.max_length}.pth"
+        encoder._null_cache_path = lambda: cache
+        return (IrisTextEncoder(encoder),)
+
+
+class IrisTextEncode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text_encoder": ("IRIS_TEXT_ENCODER",),
+                "positive": ("STRING", {"multiline": True, "default": "a red fox sleeping in fresh snow, golden hour"}),
+                "negative": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": "empty = the null prompt Iris was trained with (recommended)",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_CONDITIONING",)
+    FUNCTION = "encode"
+    CATEGORY = "Iris-3B"
+
+    @torch.no_grad()
+    def encode(self, text_encoder, positive, negative):
+        enc = text_encoder.encoder
+        device = mm.get_torch_device()
+        mm.free_memory(text_encoder.nbytes + 1 * GB, device)
+        enc.to(device)
+        try:
+            cond = enc.encode([positive])
+            null = enc.null(negative)
+            result = {
+                "cond": TextEncoding(cond.embeddings.cpu(), cond.mask.cpu()),
+                "null": TextEncoding(null.embeddings.cpu(), null.mask.cpu()),
+            }
+        finally:
+            enc.to("cpu")
+            _empty_cache()
+        return (result,)
+
+
+MATCH_IMAGE = "match input image (about 1 MP)"
+# name -> (width, height); all about one megapixel, the resolution Iris was fine-tuned at
+RESOLUTIONS = {
+    "1:1 square (1024x1024)": (1024, 1024),
+    "5:4 (1120x896)": (1120, 896),
+    "4:5 (896x1120)": (896, 1120),
+    "4:3 (1152x864)": (1152, 864),
+    "3:4 (864x1152)": (864, 1152),
+    "3:2 (1216x832)": (1216, 832),
+    "2:3 (832x1216)": (832, 1216),
+    "16:9 (1344x768)": (1344, 768),
+    "9:16 (768x1344)": (768, 1344),
+    "21:9 (1536x640)": (1536, 640),
+    "9:21 (640x1536)": (640, 1536),
+}
+QUALITY = {"fast (30 steps)": 30, "balanced (50 steps)": 50, "best (100 steps)": 100}
+GUIDANCE = {"loose (cfg 2)": 2.0, "normal (cfg 3)": 3.0, "strict (cfg 4.5)": 4.5}
+MODES = ["text to image", "image to image"]
+STRENGTH = {"subtle (denoise 0.3)": 0.3, "medium (denoise 0.5)": 0.5, "strong (denoise 0.7)": 0.7}
+MODE_INPUT = (MODES, {"default": "text to image",
+                      "tooltip": "image to image starts from the connected image instead of pure noise"})
+IMAGE_INPUT = ("IMAGE", {"tooltip": "source for image to image (ignored in text to image)"})
+
+
+def _round16(v: float) -> int:
+    return max(256, int(round(v / 16)) * 16)
+
+
+def prepare_image(image: torch.Tensor, width: int | None, height: int | None) -> torch.Tensor:
+    """IMAGE [B, H, W, C] in 0..1 -> [B, 3, H, W] in -1..1. With a target size the image
+    is scaled to cover it and center-cropped; without one it keeps its aspect ratio at
+    about one megapixel."""
+    F = torch.nn.functional
+    x = image[..., :3].permute(0, 3, 1, 2).float()
+    h, w = x.shape[-2:]
+    if width is None or height is None:
+        scale = (1024 * 1024 / (h * w)) ** 0.5
+        width, height = _round16(w * scale), _round16(h * scale)
+    scale = max(width / w, height / h)
+    size = (max(height, round(h * scale)), max(width, round(w * scale)))
+    x = F.interpolate(x, size=size, mode="bicubic", align_corners=False, antialias=True)
+    top, left = (size[0] - height) // 2, (size[1] - width) // 2
+    return (x[..., top:top + height, left:left + width].clamp(0, 1) * 2 - 1).contiguous()
+
+SEED = ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True})
+BATCH = ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": "images per run"})
+
+@torch.no_grad()
+def run_sampler(model, conditioning, width, height, steps, cfg, seed, batch_size,
+                shift=4.0, solver_order=2, cfg_start=0.0, cfg_end=1.0, keep_model_on_gpu=False,
+                init_image=None, denoise=1.0):
+    """``init_image`` ([B, 3, H, W] in -1..1) turns this into image to image: the run
+    takes the last ``steps`` steps of a ``steps / denoise`` grid, starting from the
+    image noised to that grid's first level. A batch of one image is repeated."""
+    if init_image is not None:
+        height, width = init_image.shape[-2:]
+        if init_image.shape[0] > 1:
+            batch_size = init_image.shape[0]
+    p = model.cfg.model.patch_size
+    if width % p or height % p:
+        raise ValueError(f"width and height must be multiples of {p}")
+    device = mm.get_torch_device()
+    dit = model.model
+    activations = int(2.5 * GB * batch_size * (width * height) / (1024 * 1024))
+    mm.free_memory(model.nbytes + activations, device)
+    dit.to(device)
+
+    dtype = model.dtype
+    cond = conditioning["cond"].embeddings.to(device, dtype).expand(batch_size, *([-1] * (conditioning["cond"].embeddings.ndim - 1)))
+    cond_mask = conditioning["cond"].mask.to(device).expand(batch_size, -1)
+    uncond = conditioning["null"].embeddings.to(device, dtype).expand(batch_size, *([-1] * (conditioning["null"].embeddings.ndim - 1)))
+    null_mask = conditioning["null"].mask.to(device).expand(batch_size, -1)
+    cfg_mask = torch.cat([null_mask, cond_mask], dim=0)
+
+    # same noise as scripts/sample.py for a given seed (drawn on the GPU)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn(batch_size, model.cfg.model.in_channels, height, width, generator=generator, device=device)
+    img2img = init_image is not None and denoise < 1.0
+    total = max(steps, round(steps / max(denoise, 1e-3))) if img2img else steps
+
+    def model_fn(xin, t_model, y):
+        mm.throw_exception_if_processing_interrupted()
+        out = dit(xin.to(dtype), t_model, y, y_mask=cond_mask if y is cond else cfg_mask)
+        return out.x.float()
+
+    solver = FlowDPMSolver(
+        model_fn,
+        num_timesteps=model.cfg.flow.num_train_timesteps,
+        cfg_scale=cfg,
+        cfg_interval=(cfg_start, cfg_end),
+        prediction=model.cfg.flow.prediction,
+    )
+    previews = _previews_enabled()
+    pbar = comfy.utils.ProgressBar(steps)
+    autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+    try:
+        with autocast:
+            # FlowDPMSolver.sample() with a per-step callback; x0 is already an image
+            grid = solver.time_grid(total, shift)[-(steps + 1):]
+            if img2img:
+                t0 = grid[0]
+                image = init_image.to(device, torch.float32).expand(batch_size, -1, -1, -1)
+                x = (1.0 - t0) * image + t0 * x
+            history = []
+            for i in range(1, steps + 1):
+                s, t = grid[i - 1], grid[i]
+                x0 = solver._pred_x0(x, s, cond, uncond)
+                history.append((s, x0))
+                step_order = min(i, solver_order, steps + 1 - i)
+                if step_order == 1:
+                    x = solver._first_order(x, s, t, x0)
+                else:
+                    x = solver._second_order(x, history[-2], history[-1], t)
+                if len(history) > 2:
+                    history.pop(0)
+                pbar.update_absolute(i, steps, _preview(x0) if previews and i < steps else None)
+        images = ((x.clamp(-1, 1) + 1) / 2).permute(0, 2, 3, 1).float().cpu()
+    finally:
+        if not keep_model_on_gpu:
+            dit.to("cpu")
+        del x, cond, uncond
+        _empty_cache()
+    return images
+
+
+@torch.no_grad()
+def run_turbo_sampler(model, conditioning, width, height, steps, seed, batch_size, shift,
+                      keep_model_on_gpu=False, init_image=None, denoise=1.0):
+    """The distilled few-step loop (same math as the Turbo Space's generate_turbo):
+    ``steps`` evaluations on the shifted grid ``t_i = shift(1 - i / steps)``, each a
+    single forward pass — CFG is baked into the merged adapter — and between
+    evaluations the predicted clean image is re-noised to the next level with fresh
+    noise. Not the DPM++ ODE: DPM++ at 4 steps gives a different, worse image from
+    a turbo model, so this loop is the only correct way to run one.
+
+    ``init_image`` + ``denoise`` starts from the image noised to grid time ``t``
+    instead of pure noise, running the last ``round(steps * denoise)`` times of the
+    grid. A batch of one image is repeated."""
+    if init_image is not None:
+        height, width = init_image.shape[-2:]
+        if init_image.shape[0] > 1:
+            batch_size = init_image.shape[0]
+    p = model.cfg.model.patch_size
+    if width % p or height % p:
+        raise ValueError(f"width and height must be multiples of {p}")
+    device = mm.get_torch_device()
+    dit = model.model
+    activations = int(2.5 * GB * batch_size * (width * height) / (1024 * 1024))
+    mm.free_memory(model.nbytes + activations, device)
+    dit.to(device)
+
+    dtype = model.dtype
+    enc = conditioning["cond"]
+    cond = enc.embeddings.to(device, dtype).expand(batch_size, *([-1] * (enc.embeddings.ndim - 1)))
+    cond_mask = enc.mask.to(device).expand(batch_size, -1)
+
+    # same noise as scripts/sample.py for a given seed (drawn on the GPU); the
+    # re-noise draws continue from this generator, like generate_turbo does
+    generator = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn(batch_size, model.cfg.model.in_channels, height, width, generator=generator, device=device)
+    times = turbo_times(steps, shift)
+    if init_image is not None and denoise < 1.0:
+        keep = max(1, round(steps * denoise))
+        times = times[steps - keep:]
+        x = (1.0 - times[0]) * init_image.to(device, torch.float32).expand(batch_size, -1, -1, -1) \
+            + times[0] * x
+
+    num_train_timesteps = model.cfg.flow.num_train_timesteps
+    previews = _previews_enabled()
+    pbar = comfy.utils.ProgressBar(len(times))
+    autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+    try:
+        with autocast:
+            for i, t_now in enumerate(times):
+                mm.throw_exception_if_processing_interrupted()
+                t = torch.full((batch_size,), t_now, device=device, dtype=torch.float32)
+                x0 = x - t_now * dit(x.to(dtype), t * num_train_timesteps, cond, y_mask=cond_mask).x.float()
+                if i + 1 == len(times):
+                    break
+                fresh = torch.randn(x.shape, generator=generator, device=device)
+                x = (1.0 - times[i + 1]) * x0 + times[i + 1] * fresh
+                pbar.update_absolute(i + 1, len(times), _preview(x0) if previews else None)
+        images = ((x0.clamp(-1, 1) + 1) / 2).permute(0, 2, 3, 1).float().cpu()
+    finally:
+        if not keep_model_on_gpu:
+            dit.to("cpu")
+        del x, cond
+        _empty_cache()
+    return images
+
+
+class IrisTurboSampler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("IRIS_MODEL",),
+                "conditioning": ("IRIS_CONDITIONING",),
+                "mode": MODE_INPUT,
+                "resolution": ([MATCH_IMAGE] + list(RESOLUTIONS), {
+                    "default": "1:1 square (1024x1024)",
+                    "tooltip": "the adapters were distilled at about 1 MP",
+                }),
+                "image_strength": (list(STRENGTH), {
+                    "default": "medium (denoise 0.5)",
+                    "tooltip": "image to image only: how much the image may change. The step count stays "
+                               "the same, so every strength costs the same time and 0.5 and 0.7 look close",
+                }),
+                "seed": SEED,
+                "batch_size": BATCH,
+            },
+            "optional": {"image": IMAGE_INPUT},
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "sample"
+    CATEGORY = "Iris-3B"
+    DESCRIPTION = ("4-step sampling for a model loaded with an Iris Turbo LoRA: one forward per "
+                   "step, no CFG. Takes steps and shift from the adapter's metadata.")
+
+    def sample(self, model, conditioning, mode, resolution, image_strength, seed, batch_size, image=None):
+        if not model.turbo:
+            raise ValueError(
+                "this model has no Turbo LoRA merged in. Pick a turbo_lora in the Load Iris-3B Model "
+                "node, or use an Iris Sampler for the base model.")
+        steps = int(model.turbo.get("steps", 4))
+        shift = float(model.turbo.get("shift", 4.0))
+        init = None
+        if mode == "image to image":
+            if image is None:
+                raise ValueError("image to image needs an image connected to the sampler")
+            size = (None, None) if resolution == MATCH_IMAGE else RESOLUTIONS[resolution]
+            init = prepare_image(image, *size)
+            width, height = init.shape[-1], init.shape[-2]
+        else:
+            width, height = RESOLUTIONS.get(resolution, (1024, 1024))
+        images = run_turbo_sampler(model, conditioning, width, height, steps, seed, batch_size, shift,
+                                   init_image=init, denoise=STRENGTH[image_strength])
+        return (images,)
+
+
+class IrisSamplerSimple:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("IRIS_MODEL",),
+                "conditioning": ("IRIS_CONDITIONING",),
+                "mode": MODE_INPUT,
+                "resolution": ([MATCH_IMAGE] + list(RESOLUTIONS), {
+                    "default": "1:1 square (1024x1024)",
+                    "tooltip": "in image to image the input is cropped to this size, or keeps its own "
+                               "aspect ratio with match input image",
+                }),
+                "quality": (list(QUALITY), {"default": "fast (30 steps)",
+                                            "tooltip": "100 steps is the model card default, about 3x slower than fast"}),
+                "prompt_adherence": (list(GUIDANCE), {"default": "normal (cfg 3)",
+                                                      "tooltip": "how strictly the image follows the prompt"}),
+                "image_strength": (list(STRENGTH), {
+                    "default": "medium (denoise 0.5)",
+                    "tooltip": "image to image only: how much the image may change",
+                }),
+                "seed": SEED,
+                "batch_size": BATCH,
+            },
+            "optional": {"image": IMAGE_INPUT},
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "sample"
+    CATEGORY = "Iris-3B"
+    DESCRIPTION = "Iris-3B sampler with presets. Use the Advanced sampler for exact sizes and solver settings."
+
+    def sample(self, model, conditioning, mode, resolution, quality, prompt_adherence, image_strength, seed,
+               batch_size, image=None):
+        init = None
+        if mode == "image to image":
+            if image is None:
+                raise ValueError("image to image needs an image connected to the sampler")
+            size = (None, None) if resolution == MATCH_IMAGE else RESOLUTIONS[resolution]
+            init = prepare_image(image, *size)
+            width, height = init.shape[-1], init.shape[-2]
+        else:
+            width, height = RESOLUTIONS.get(resolution, (1024, 1024))
+        images = run_sampler(model, conditioning, width, height, QUALITY[quality], GUIDANCE[prompt_adherence],
+                             seed, batch_size, init_image=init, denoise=STRENGTH[image_strength])
+        return (images,)
+
+
+class IrisSamplerAdvanced:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("IRIS_MODEL",),
+                "conditioning": ("IRIS_CONDITIONING",),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 500, "tooltip": "the model card default is 100. "
+                                                                                 "A Turbo LoRA model wants the Iris Turbo Sampler"}),
+                "cfg": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 20.0, "step": 0.1}),
+                "seed": SEED,
+                "batch_size": BATCH,
+                "mode": MODE_INPUT,
+                "denoise": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 1.0, "step": 0.01,
+                                      "tooltip": "image to image only: 1 ignores the image content, lower "
+                                                 "values keep more of it. Steps stays fixed and the grid is "
+                                                 "stretched to steps/denoise, so time does not change and "
+                                                 "nearby values look similar"}),
+                "shift": ("FLOAT", {"default": 4.0, "min": 0.1, "max": 20.0, "step": 0.1,
+                                    "tooltip": "flow shift (trained with 4.0)"}),
+                "solver_order": ("INT", {"default": 2, "min": 1, "max": 2, "tooltip": "DPM-Solver++ order"}),
+                "cfg_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                                        "tooltip": "CFG applies only for noise levels t in (cfg_start, cfg_end); 1 = pure noise"}),
+                "cfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "width": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 16,
+                                  "tooltip": "in image to image the input is scaled and cropped to this size"}),
+                "height": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 16}),
+                "keep_model_on_gpu": ("BOOLEAN", {"default": False,
+                                                  "tooltip": "skip moving the 6 GB DiT back to RAM after sampling"}),
+            },
+            "optional": {
+                "image": IMAGE_INPUT,
+                "turbo_lora": (["none"] + _lora_files(), {
+                    "tooltip": "merge an Iris Turbo LoRA from models/loras into this model (same as the "
+                               "Load node's input). With one merged, use the Iris Turbo Sampler instead of "
+                               "these DPM++ settings; running DPM++ on a turbo model gives washed-out results",
+                }),
+                "lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "sample"
+    CATEGORY = "Iris-3B"
+
+    def sample(self, model, conditioning, steps, cfg, seed, batch_size, mode, denoise, shift, solver_order,
+               cfg_start, cfg_end, width, height, keep_model_on_gpu, image=None, turbo_lora="none",
+               lora_strength=1.0):
+        if turbo_lora != "none":
+            if model.turbo:
+                raise ValueError(
+                    f"{model.name} already has a Turbo LoRA merged in; this sampler would merge "
+                    f"{turbo_lora} on top of it. Load the base model instead.")
+            model.turbo = _merge_turbo_lora(model.model, turbo_lora, lora_strength)
+        if model.turbo:
+            log.warning("%s has a Turbo LoRA merged in but this DPM++ sampler is running it at %s steps "
+                        "with cfg %s; use the Iris Turbo Sampler for the intended 4-step result",
+                        model.name, steps, cfg)
+        init = None
+        if mode == "image to image":
+            if image is None:
+                raise ValueError("image to image needs an image connected to the sampler")
+            init = prepare_image(image, width, height)
+        images = run_sampler(model, conditioning, width, height, steps, cfg, seed, batch_size,
+                             shift, solver_order, cfg_start, cfg_end, keep_model_on_gpu,
+                             init_image=init, denoise=denoise)
+        return (images,)
+
+
+class IrisUpscaler:
+    def __init__(self, model: IrisDiT, cfg, dtype: torch.dtype, settings: dict, prompt: dict):
+        self.model, self.cfg, self.dtype = model, cfg, dtype
+        self.sigma = float(settings["sigma"])
+        self.tile = int(settings.get("tile", 1024))
+        self.embeddings = prompt["embeddings"].to(dtype)
+        self.mask = prompt["mask"].bool()
+        self.nbytes = _nbytes(model)
+
+
+def _task_prompt(weights: str, task_dir: str) -> str:
+    """empty_prompt.safetensors next to Hub-layout weights, else the pack's cached copy
+    of ``<task_dir>/empty_prompt.safetensors`` from the Hub."""
+    side = os.path.join(os.path.dirname(weights), "empty_prompt.safetensors")
+    if os.path.basename(weights) == "model.safetensors" and os.path.isfile(side):
+        return side
+    cached = os.path.join(NULL_CACHE_DIR, f"iris-3b-{task_dir}_empty_prompt.safetensors")
+    return cached if os.path.isfile(cached) else _fetch(IRIS_REPO, f"{task_dir}/empty_prompt.safetensors", cached)
+
+
+class IrisUpscalerLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (_with_default(_iris_files("upscaler"), UPSCALER_FILE), {
+                    "tooltip": f"Iris upscaler weights in models/diffusion_models. {UPSCALER_FILE} is "
+                               "downloaded on first use if missing (12 GB)",
+                }),
+                "weight_dtype": DTYPE_INPUT,
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_UPSCALER",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, model_name):
+        return True  # a missing default is downloaded by load()
+
+    def load(self, model_name, weight_dtype):
+        weights = _weights_path(model_name)
+        dtype = DTYPES[weight_dtype]
+        model, cfg, task = _build_dit(weights, _config_path(weights, STOCK[UPSCALER_FILE][1]), dtype)
+        if not task or task.get("name") != "restoration":
+            raise ValueError(f"{model_name} is not an Iris restoration model")
+        prompt = load_file(_task_prompt(weights, "upscaler"))
+        log.info("loaded %s as %s", model_name, weight_dtype)
+        return (IrisUpscaler(model, cfg, dtype, task, prompt),)
+
+
+class IrisUpscale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "upscaler": ("IRIS_UPSCALER",),
+                "image": ("IMAGE",),
+                "scale": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 4.0, "step": 0.5,
+                                    "tooltip": "trained for 4x. Lower values restore at a smaller size"}),
+                "limit_input_size": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "shrink the input first so its short side is at most 512 px and its long side "
+                               "at most 1024 px (at 4x: at most 2048x4096, 21 tiles). Off keeps the input "
+                               "size, and the time grows with the output area",
+                }),
+                "color_fix": ("BOOLEAN", {"default": True,
+                                          "tooltip": "keep the input's colors (wavelet color fix)"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "upscale"
+    CATEGORY = "Iris-3B"
+    DESCRIPTION = "Iris-3B restoration and 4x upscaling. One model pass per 1024 px tile."
+
+    @torch.no_grad()
+    def upscale(self, upscaler, image, scale, limit_input_size, color_fix):
+        from iris3b.downstream.restoration import gaussian_window, tile_positions, wavelet_color_fix
+
+        F = torch.nn.functional
+        device = mm.get_torch_device()
+        up = upscaler
+        tile, stride, patch = up.tile, up.tile // 2, up.cfg.model.patch_size
+        mm.free_memory(up.nbytes + 2 * GB, device)
+        up.model.to(device)
+        embeddings = up.embeddings.to(device)
+        mask = up.mask.to(device)
+        t_model = torch.full((1,), up.sigma * up.cfg.flow.num_train_timesteps, device=device)
+
+        def restore(x):
+            mm.throw_exception_if_processing_interrupted()
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                v = up.model(x.to(up.dtype), t_model, embeddings, y_mask=mask).x
+            return x.float() - up.sigma * v.float()
+
+        outputs = []
+        try:
+            for frame in image:
+                lq = frame[..., :3].permute(2, 0, 1)[None].to(device, torch.float32)
+                if limit_input_size:
+                    h, w = lq.shape[-2:]
+                    shrink = min(1.0, 512 / min(h, w), 1024 / max(h, w))
+                    if shrink < 1.0:
+                        size = (max(1, round(h * shrink)), max(1, round(w * shrink)))
+                        lq = F.interpolate(lq, size=size, mode="bicubic", align_corners=False, antialias=True)
+                reference = F.interpolate(lq, scale_factor=scale, mode="bicubic", align_corners=False)
+                out_size = reference.shape[-2:]
+                x = reference
+                if min(out_size) <= tile:
+                    ratio = tile / min(out_size)
+                    work = tuple(max(tile, round(side * ratio)) for side in out_size)
+                    x = F.interpolate(x, size=work, mode="bicubic", align_corners=False, antialias=True)
+                height, width = x.shape[-2:]
+                x = F.pad(x * 2 - 1, (0, -width % patch, 0, -height % patch))
+
+                # upstream's tiled(): 50% overlap, Gaussian-weighted fusion, plus a progress bar
+                rows = tile_positions(x.shape[-2], tile, stride)
+                cols = tile_positions(x.shape[-1], tile, stride)
+                pbar = comfy.utils.ProgressBar(len(rows) * len(cols))
+                if len(rows) == 1 and len(cols) == 1:
+                    y = restore(x)
+                    pbar.update_absolute(1)
+                else:
+                    window = gaussian_window(tile, device)
+                    y = torch.zeros_like(x)
+                    weight = torch.zeros_like(x[:, :1])
+                    done = 0
+                    for top in rows:
+                        for left in cols:
+                            crop = (..., slice(top, top + tile), slice(left, left + tile))
+                            y[crop] += restore(x[crop].contiguous()) * window
+                            weight[crop] += window
+                            done += 1
+                            pbar.update_absolute(done)
+                    y = y / weight
+
+                y = (y[..., :height, :width] + 1) / 2
+                if (height, width) != tuple(out_size):
+                    y = F.interpolate(y, size=out_size, mode="bicubic", align_corners=False, antialias=True)
+                if color_fix:
+                    y = wavelet_color_fix(y, reference)
+                outputs.append(y.clamp(0, 1)[0].permute(1, 2, 0).cpu())
+        finally:
+            up.model.to("cpu")
+            _empty_cache()
+        if len({o.shape for o in outputs}) != 1:
+            raise ValueError("images in the batch upscaled to different sizes")
+        return (torch.stack(outputs),)
+
+
+class IrisDepthModel:
+    def __init__(self, model, cfg, dtype: torch.dtype, prompt: dict):
+        self.model, self.cfg, self.dtype = model, cfg, dtype
+        self.embeddings = prompt["embeddings"].to(dtype)
+        self.mask = prompt["mask"].bool()
+        self.nbytes = _nbytes(model)
+
+
+class IrisDepthLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (_with_default(_iris_files("depth"), DEPTH_FILE), {
+                    "tooltip": f"Iris depth weights in models/diffusion_models. {DEPTH_FILE} is "
+                               "downloaded on first use if missing (12 GB)",
+                }),
+                "weight_dtype": DTYPE_INPUT,
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_DEPTH_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, model_name):
+        return True  # a missing default is downloaded by load()
+
+    def load(self, model_name, weight_dtype):
+        from iris3b.downstream.depth import IrisDepth
+
+        weights_path = _weights_path(model_name)
+        dtype = DTYPES[weight_dtype]
+        raw = OmegaConf.to_container(OmegaConf.load(_config_path(weights_path, STOCK[DEPTH_FILE][1])))
+        task = raw.pop("task", None)
+        if not task or task.get("name") != "depth":
+            raise ValueError(f"{model_name} is not an Iris depth model")
+        cfg = inference_config(raw)
+        weights = _load_weights(weights_path, dtype)
+        with torch.device("meta"):
+            model = IrisDepth(cfg.model)
+        model.num_train_timesteps = cfg.flow.num_train_timesteps
+        model.load_state_dict(weights, strict=True, assign=True)
+        del weights
+        model = model.train(False).requires_grad_(False).to(dtype=dtype)
+        prompt = load_file(_task_prompt(weights_path, "depth"))
+        log.info("loaded %s as %s", model_name, weight_dtype)
+        return (IrisDepthModel(model, cfg, dtype, prompt),)
+
+
+class IrisDepthEstimate:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "depth_model": ("IRIS_DEPTH_MODEL",),
+                "image": ("IMAGE",),
+                "max_side": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 16,
+                                     "tooltip": "long side the model sees; the map is resized back to the input "
+                                                "size. 0 keeps the input size"}),
+                "colors": (["grayscale (near = white)", "inferno"], {
+                    "default": "grayscale (near = white)",
+                    "tooltip": "grayscale is what depth ControlNets expect",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "IRIS_DEPTH")
+    RETURN_NAMES = ("depth", "depth_mask", "depth_3d")
+    FUNCTION = "estimate"
+    CATEGORY = "Iris-3B"
+    DESCRIPTION = ("Iris-3B monocular depth: one model pass per image. Relative depth (not metric), "
+                   "scaled to each image's 2nd to 98th percentile.")
+
+    @torch.no_grad()
+    def estimate(self, depth_model, image, max_side, colors):
+        F = torch.nn.functional
+        dm = depth_model
+        device = mm.get_torch_device()
+        patch = dm.cfg.model.patch_size
+        mm.free_memory(dm.nbytes + 2 * GB, device)
+        dm.model.to(device)
+        embeddings, mask = dm.embeddings.to(device), dm.mask.to(device)
+        maps, raws = [], []
+        pbar = comfy.utils.ProgressBar(len(image))
+        try:
+            for i, frame in enumerate(image):
+                mm.throw_exception_if_processing_interrupted()
+                rgb = frame[..., :3].permute(2, 0, 1)[None].to(device, torch.float32)
+                height, width = rgb.shape[-2:]
+                scale = min(1.0, max_side / max(width, height)) if max_side else 1.0
+                size = tuple(max(patch, round(side * scale / patch) * patch) for side in (height, width))
+                if size != (height, width):
+                    rgb = F.interpolate(rgb, size=size, mode="bicubic", align_corners=False, antialias=True)
+                rgb = rgb.clamp(0, 1) * 2 - 1
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    depth = dm.model(rgb.to(dm.dtype), embeddings, mask).float()
+                if depth.shape[-2:] != (height, width):
+                    depth = F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
+                # upstream colorize(): near = bright over the 2nd..98th percentile
+                d = depth[0, 0]
+                raws.append(d.cpu())
+                low, high = torch.quantile(d.flatten()[:: max(1, d.numel() // 1_000_000)], torch.tensor([0.02, 0.98], device=device))
+                maps.append(((high - d) / (high - low).clamp_min(1e-6)).clamp(0, 1).cpu())
+                pbar.update_absolute(i + 1)
+        finally:
+            dm.model.to("cpu")
+            _empty_cache()
+        near = torch.stack(maps)
+        if colors == "inferno":
+            try:
+                from matplotlib import colormaps
+
+                rgb = torch.from_numpy(colormaps["inferno"](near.numpy())[..., :3]).float()
+            except ImportError:
+                log.warning("matplotlib is missing, using grayscale")
+                rgb = near[..., None].expand(-1, -1, -1, 3)
+        else:
+            rgb = near[..., None].expand(-1, -1, -1, 3).contiguous()
+        return (rgb, near, {"log_depth": raws, "image": image[..., :3].cpu()})
+
+
+def _write_ply(path: str, xyz, rgb, faces=None) -> None:
+    """Binary little-endian PLY: float xyz, uchar rgb, optional triangle faces."""
+    import numpy as np
+
+    header = ["ply", "format binary_little_endian 1.0", f"element vertex {len(xyz)}",
+              "property float x", "property float y", "property float z",
+              "property uchar red", "property uchar green", "property uchar blue"]
+    if faces is not None:
+        header += [f"element face {len(faces)}", "property list uchar int vertex_indices"]
+    header.append("end_header")
+    vertex = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                       ("r", "u1"), ("g", "u1"), ("b", "u1")])
+    vertex["x"], vertex["y"], vertex["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    vertex["r"], vertex["g"], vertex["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    with open(path, "wb") as f:
+        f.write(("\n".join(header) + "\n").encode("ascii"))
+        f.write(vertex.tobytes())
+        if faces is not None:
+            face = np.empty(len(faces), dtype=[("n", "u1"), ("i", "<i4", (3,))])
+            face["n"], face["i"] = 3, faces
+            f.write(face.tobytes())
+
+
+class IrisDepthTo3D:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "depth_3d": ("IRIS_DEPTH", {"tooltip": "the depth_3d output of Iris Depth"}),
+                "mode": (["point cloud", "mesh"], {
+                    "default": "point cloud",
+                    "tooltip": "mesh joins neighboring points into triangles and leaves gaps at depth edges",
+                }),
+                "fov": ("FLOAT", {"default": 60.0, "min": 10.0, "max": 150.0, "step": 1.0,
+                                  "tooltip": "assumed horizontal field of view of the photo, in degrees"}),
+                "max_points": ("INT", {"default": 500000, "min": 10000, "max": 4000000, "step": 10000,
+                                       "tooltip": "the depth map is subsampled to stay under this"}),
+                "filename_prefix": ("STRING", {"default": "iris3b_depth3d"}),
+            }
+        }
+
+    RETURN_TYPES = ("FILE_3D",)
+    RETURN_NAMES = ("model_3d",)
+    FUNCTION = "build"
+    OUTPUT_NODE = True
+    CATEGORY = "Iris-3B"
+    DESCRIPTION = ("Turns Iris depth into a colored point cloud or mesh (.ply in the output folder). "
+                   "Connect it to Preview 3D to orbit around it.")
+
+    def build(self, depth_3d, mode, fov, max_points, filename_prefix):
+        import numpy as np
+
+        log_depth, image = depth_3d["log_depth"], depth_3d["image"]
+        out_dir = folder_paths.get_output_directory()
+        full, name, counter, subfolder, _ = folder_paths.get_save_image_path(filename_prefix, out_dir)
+        paths = []
+        for i, d in enumerate(log_depth):
+            d = d.float().numpy()
+            h, w = d.shape
+            rgb = (image[i].float().clamp(0, 1).numpy() * 255).round().astype(np.uint8)
+            stride = max(1, int(np.ceil(np.sqrt(h * w / max_points))))
+            v, u = np.mgrid[0:h:stride, 0:w:stride]
+            # as in upstream's demo viewer: exp of relative log depth is depth up to
+            # scale, rescaled to a median of 3 for viewing
+            z = np.exp(d[v, u].astype(np.float64))
+            z = 3 * z / np.median(z)
+            f = (w / 2) / np.tan(np.radians(fov) / 2)
+            # three.js is y-up and looks down -z
+            xyz = np.stack([(u + 0.5 - w / 2) * z / f, -(v + 0.5 - h / 2) * z / f, -z], -1).reshape(-1, 3)
+            colors = rgb[v, u].reshape(-1, 3)
+            faces = None
+            if mode == "mesh":
+                gh, gw = v.shape
+                idx = np.arange(gh * gw).reshape(gh, gw)
+                a, b, c, e = idx[:-1, :-1], idx[:-1, 1:], idx[1:, :-1], idx[1:, 1:]
+                tris = np.concatenate([np.stack([a, c, b], -1).reshape(-1, 3),
+                                       np.stack([b, c, e], -1).reshape(-1, 3)])
+                zf = z.reshape(-1)[tris]
+                # drop triangles that stretch across a depth edge
+                tris = tris[zf.max(1) / zf.min(1) < 1.08]
+                faces = tris.astype(np.int32)
+            path = os.path.join(full, f"{name}_{counter + i:05}_.ply")
+            _write_ply(path, xyz.astype(np.float32), colors, faces)
+            paths.append(path)
+        log.info("wrote %s", ", ".join(paths))
+        try:
+            from comfy_api.latest import Types
+
+            model = Types.File3D(paths[0])
+        except Exception:
+            model = paths[0]
+        return (model,)
+
+
+def _previews_enabled() -> bool:
+    try:
+        from comfy.cli_args import LatentPreviewMethod, args
+        return args.preview_method != LatentPreviewMethod.NoPreviews
+    except Exception:
+        return True
+
+
+def _preview(x0: torch.Tensor):
+    from PIL import Image
+
+    try:
+        from latent_preview import MAX_PREVIEW_RESOLUTION
+    except Exception:
+        MAX_PREVIEW_RESOLUTION = 512
+    img = x0[:1].float().clamp(-1, 1)
+    scale = MAX_PREVIEW_RESOLUTION / max(img.shape[-2:])
+    if scale < 1:
+        img = torch.nn.functional.interpolate(img, scale_factor=scale, mode="area")
+    arr = ((img[0] + 1) * 127.5).round().byte().permute(1, 2, 0).cpu().numpy()
+    return ("JPEG", Image.fromarray(arr), MAX_PREVIEW_RESOLUTION)
+
+
+NODE_CLASS_MAPPINGS = {
+    "IrisModelLoader": IrisModelLoader,
+    "IrisTurboLoRALoader": IrisTurboLoRALoader,
+    "IrisTextEncoderLoader": IrisTextEncoderLoader,
+    "IrisTextEncode": IrisTextEncode,
+    "IrisTurboSampler": IrisTurboSampler,
+    "IrisSamplerSimple": IrisSamplerSimple,
+    "IrisSamplerAdvanced": IrisSamplerAdvanced,
+    "IrisUpscalerLoader": IrisUpscalerLoader,
+    "IrisUpscale": IrisUpscale,
+    "IrisDepthLoader": IrisDepthLoader,
+    "IrisDepthEstimate": IrisDepthEstimate,
+    "IrisDepthTo3D": IrisDepthTo3D,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "IrisModelLoader": "Load Iris-3B Model",
+    "IrisTurboLoRALoader": "Load Iris Turbo LoRA",
+    "IrisTextEncoderLoader": "Load Iris Text Encoder (Qwen3-VL-4B)",
+    "IrisTextEncode": "Iris Text Encode",
+    "IrisTurboSampler": "Iris Turbo Sampler (4 steps)",
+    "IrisSamplerSimple": "Iris Sampler (Simple)",
+    "IrisSamplerAdvanced": "Iris Sampler (Advanced)",
+    "IrisUpscalerLoader": "Load Iris Upscaler",
+    "IrisUpscale": "Iris Upscale",
+    "IrisDepthLoader": "Load Iris Depth Model",
+    "IrisDepthEstimate": "Iris Depth",
+    "IrisDepthTo3D": "Iris Depth to 3D",
+}

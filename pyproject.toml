@@ -1,0 +1,14 @@
+[project]
+name = "iris-3b-comfy-nodes-4steps"
+description = "Iris-3B nodes with 4-step Turbo LoRA support: merge a Turbo adapter from models/loras and generate a 1024 px image in 4 forwards. Also the base samplers, image to image, the 4x upscaler, depth and a 3D view, auto model download, low VRAM."
+version = "1.3.1+4steps"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/bani4kaskashka/Iris-3B-Comfy-Nodes-4steps"
+"Bug Tracker" = "https://github.com/bani4kaskashka/Iris-3B-Comfy-Nodes-4steps/issues"
+
+[tool.comfy]
+PublisherId = "ca11mebucky"
+DisplayName = "Iris-3B 4steps (supersedes Iris-3B)"

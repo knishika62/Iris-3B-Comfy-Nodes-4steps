@@ -1,0 +1,397 @@
+{
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        80
+      ],
+      "size": [
+        340,
+        360
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example.png",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "IrisDepthLoader",
+      "pos": [
+        420,
+        80
+      ],
+      "size": [
+        320,
+        82
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IRIS_DEPTH_MODEL",
+          "type": "IRIS_DEPTH_MODEL",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisDepthLoader",
+        "models": [
+          {
+            "name": "iris-3b-depth.safetensors",
+            "url": "https://huggingface.co/speridlabs/iris-3b/resolve/main/depth/model.safetensors",
+            "directory": "diffusion_models"
+          }
+        ]
+      },
+      "widgets_values": [
+        "iris-3b-depth.safetensors",
+        "bf16"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "IrisDepthEstimate",
+      "pos": [
+        420,
+        210
+      ],
+      "size": [
+        320,
+        130
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "depth_model",
+          "type": "IRIS_DEPTH_MODEL",
+          "link": 1
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        },
+        {
+          "name": "IRIS_DEPTH",
+          "type": "IRIS_DEPTH",
+          "links": [
+            4
+          ],
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisDepthEstimate"
+      },
+      "widgets_values": [
+        1024,
+        "grayscale (near = white)"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SaveImage",
+      "pos": [
+        780,
+        80
+      ],
+      "size": [
+        480,
+        560
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "iris3b_depth"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "IrisDepthTo3D",
+      "pos": [
+        420,
+        400
+      ],
+      "size": [
+        320,
+        150
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "depth_3d",
+          "type": "IRIS_DEPTH",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "FILE_3D",
+          "type": "FILE_3D",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisDepthTo3D"
+      },
+      "widgets_values": [
+        "point cloud",
+        60.0,
+        500000,
+        "iris3b_depth3d"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "Preview3DAdvanced",
+      "pos": [
+        1300,
+        80
+      ],
+      "size": [
+        720,
+        720
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model_3d",
+          "type": "FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_FBX,FILE_3D_OBJ,FILE_3D_STL,FILE_3D_USDZ,FILE_3D",
+          "link": 5
+        },
+        {
+          "name": "model_3d_info",
+          "type": "LOAD3D_MODEL_INFO",
+          "link": null,
+          "shape": 7
+        },
+        {
+          "name": "camera_info",
+          "type": "LOAD3D_CAMERA",
+          "link": null,
+          "shape": 7
+        },
+        {
+          "name": "viewport_state",
+          "type": "LOAD_3D",
+          "link": null,
+          "widget": {
+            "name": "viewport_state"
+          }
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "width"
+          }
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "height"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model_3d",
+          "type": "FILE_3D",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "model_3d_info",
+          "type": "LOAD3D_MODEL_INFO",
+          "links": [],
+          "slot_index": 1
+        },
+        {
+          "name": "camera_info",
+          "type": "LOAD3D_CAMERA",
+          "links": [],
+          "slot_index": 2
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [],
+          "slot_index": 3
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [],
+          "slot_index": 4
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Preview3DAdvanced",
+        "Camera Config": {
+          "cameraType": "perspective",
+          "fov": 35,
+          "hasCustomUp": false
+        },
+        "Light Config": {
+          "intensity": 3,
+          "hdri": {
+            "enabled": false,
+            "hdriPath": "",
+            "showAsBackground": false,
+            "intensity": 1
+          }
+        },
+        "Model Config": {
+          "upDirection": "original",
+          "materialMode": "original",
+          "showSkeleton": false
+        },
+        "Scene Config": {
+          "showGrid": false,
+          "backgroundColor": "#000000",
+          "backgroundImage": "",
+          "backgroundRenderMode": "tiled"
+        }
+      },
+      "widgets_values": [
+        "",
+        1024,
+        1024
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      3,
+      0,
+      "IRIS_DEPTH_MODEL"
+    ],
+    [
+      2,
+      1,
+      0,
+      3,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      3,
+      2,
+      5,
+      0,
+      "IRIS_DEPTH"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "FILE_3D"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.8,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4,
+  "models": [
+    {
+      "name": "iris-3b-depth.safetensors",
+      "url": "https://huggingface.co/speridlabs/iris-3b/resolve/main/depth/model.safetensors",
+      "directory": "diffusion_models"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+vendored from github.com/speridlabs/iris-3b @ a8d1523 (src/iris3b, inference, restoration and depth modules only; Apache-2.0)
+changes: removed the unused sampling.py and seeding.py, optional flash-attn backends use plain imports,
+the unused torch.compile branch in text/qwen3_vl.py is gone, and .eval() is written as .train(False).
+
+added: lora.py from github.com/pentaCoxian/iris-3b-turbo @ 5243039 (Apache-2.0),
+unchanged, for merging the Turbo adapters in pentacoxian-dev/iris-3b-turbo-lora.

@@ -1,0 +1,261 @@
+{
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "IrisModelLoader",
+      "pos": [
+        40,
+        80
+      ],
+      "size": [
+        340,
+        130
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IRIS_MODEL",
+          "type": "IRIS_MODEL",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisModelLoader"
+      },
+      "widgets_values": [
+        "iris-3b.safetensors",
+        "bf16",
+        "iris-3b-turbo-r2-1000.safetensors",
+        1.0
+      ]
+    },
+    {
+      "id": 2,
+      "type": "IrisTextEncoderLoader",
+      "pos": [
+        40,
+        280
+      ],
+      "size": [
+        340,
+        80
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IRIS_TEXT_ENCODER",
+          "type": "IRIS_TEXT_ENCODER",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisTextEncoderLoader"
+      },
+      "widgets_values": [
+        "Qwen3-VL-4B-Instruct"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "IrisTextEncode",
+      "pos": [
+        420,
+        280
+      ],
+      "size": [
+        380,
+        160
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_encoder",
+          "type": "IRIS_TEXT_ENCODER",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IRIS_CONDITIONING",
+          "type": "IRIS_CONDITIONING",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisTextEncode"
+      },
+      "widgets_values": [
+        "a red fox sleeping in fresh snow, golden hour",
+        ""
+      ]
+    },
+    {
+      "id": 4,
+      "type": "IrisTurboSampler",
+      "pos": [
+        420,
+        80
+      ],
+      "size": [
+        340,
+        180
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "IRIS_MODEL",
+          "link": 1
+        },
+        {
+          "name": "conditioning",
+          "type": "IRIS_CONDITIONING",
+          "link": 3
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "IrisTurboSampler"
+      },
+      "widgets_values": [
+        "text to image",
+        "1:1 square (1024x1024)",
+        "medium (denoise 0.5)",
+        0,
+        "randomize",
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SaveImage",
+      "pos": [
+        820,
+        80
+      ],
+      "size": [
+        320,
+        270
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "iris3b_turbo"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "Note",
+      "pos": [
+        40,
+        460
+      ],
+      "size": [
+        760,
+        120
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "text": ""
+      },
+      "widgets_values": [
+        "4-step Turbo: the LoRA is merged in the loader (turbo_lora), and the Turbo Sampler runs the distilled 4-step schedule with no CFG. Steps and shift come from the adapter itself. The r2-1000 adapter is downloaded into models/loras on first run (460 MB)."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      0,
+      4,
+      0,
+      "IRIS_MODEL"
+    ],
+    [
+      2,
+      0,
+      3,
+      0,
+      "IRIS_TEXT_ENCODER"
+    ],
+    [
+      3,
+      0,
+      4,
+      1,
+      "IRIS_CONDITIONING"
+    ],
+    [
+      4,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4,
+  "models": [
+    {
+      "name": "iris-3b.safetensors",
+      "url": "https://huggingface.co/speridlabs/iris-3b/resolve/main/model.safetensors",
+      "directory": "diffusion_models"
+    },
+    {
+      "name": "iris-3b-turbo-r2-1000.safetensors",
+      "url": "https://huggingface.co/pentacoxian-dev/iris-3b-turbo-lora/resolve/main/r2-1000/student.safetensors",
+      "directory": "loras"
+    }
+  ]
+}
