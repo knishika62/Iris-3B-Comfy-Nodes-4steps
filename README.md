@@ -23,7 +23,7 @@ Top left: 832x1216 at 50 steps, then the 4x upscaler (3328x4864). Top right: Com
 Search for **Iris-3B 4steps** in ComfyUI-Manager, or clone into `ComfyUI/custom_nodes`:
 
 ```
-git clone https://github.com/bani4kaskashka/Iris-3B-Comfy-Nodes-4steps
+git clone https://github.com/knishika62/Iris-3B-Comfy-Nodes-4steps
 ```
 
 Nothing else to install. It needs transformers 4.57 or newer, which recent ComfyUI already has.
