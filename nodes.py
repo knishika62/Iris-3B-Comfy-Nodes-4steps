@@ -28,12 +28,15 @@ embeddings (36 MB each) are fetched next to them on first use. A
 Hub-layout folder (model.safetensors next to config.yaml) also works.
 """
 
+import copy
 import dataclasses
 import gc
+import json
 import logging
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -243,6 +246,31 @@ def _aitoolkit_lora_files() -> list[str]:
     return out
 
 
+def _is_iris_lora(path: Path) -> bool:
+    """An official-trainer Iris LoRA: rank/alpha metadata, but not a Turbo adapter."""
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            meta = f.metadata() or {}
+        return "rank" in meta and "alpha" in meta and "turbo_steps" not in meta.get("extra", "")
+    except Exception:
+        return False
+
+
+def _iris_lora_files() -> list[str]:
+    """Iris LoRAs in models/loras, subfolders included (Turbo adapters excluded,
+    they have their own loaders)."""
+    out: list[str] = []
+    for root in folder_paths.get_folder_paths("loras"):
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.safetensors")):
+            name = str(path.relative_to(base)).replace(os.sep, "/")
+            if _is_iris_lora(path):
+                out.append(name)
+    return out
+
+
 def _lora_path(name: str) -> str:
     """Full path of a listed LoRA; a missing stock Turbo adapter is fetched first."""
     path = folder_paths.get_full_path("loras", name)
@@ -306,27 +334,6 @@ def _read_aitoolkit_lora(dit: IrisDiT, path: str, name: str) -> tuple[dict, int]
     return layers, ranks.pop()
 
 
-def _merge_aitoolkit_lora(model: IrisDiT, name: str, strength: float) -> None:
-    """Fold an ai-toolkit LoRA into the model's Linear weights, in place."""
-    tensors, rank = _read_aitoolkit_lora(model, _lora_path(name), name)
-    # ai-toolkit forces peft format for transformer models, which trains with
-    # alpha = rank (the alpha buffer is not saved), so strength is the whole scale.
-    scale = strength
-    for key in tensors:
-        if not key.endswith(".lora_down"):
-            continue
-        prefix = key[: -len(".lora_down")]
-        linear = model.get_submodule(prefix)
-        down = tensors[key].to(linear.weight.device, torch.float32)
-        up = tensors[prefix + ".lora_up"].to(linear.weight.device, torch.float32)
-        if up.abs().max() == 0:
-            continue
-        merged = linear.weight.float() + scale * (up @ down)
-        linear.weight.copy_(merged.to(linear.weight.dtype))
-    log.info("merged ai-toolkit LoRA %s: %d layers, rank %d at strength %g",
-             name, len(tensors) // 2, rank, strength)
-
-
 def _merge_turbo_lora(model: IrisDiT, name: str, strength: float) -> dict:
     """Fold a Turbo adapter into the model's Linear weights; returns its metadata."""
     meta = merge_lora_file(model, _lora_path(name), strength)
@@ -337,6 +344,86 @@ def _merge_turbo_lora(model: IrisDiT, name: str, strength: float) -> dict:
         log.warning("%s has no turbo metadata; the Iris Turbo Sampler will fall back to 4 steps "
                     "and shift 4", name)
     return meta
+
+
+# --- live LoRAs (same mechanism as the upstream pack) ------------------------
+# A live LoRA is never folded into the weights: a forward hook adds its delta for
+# the length of one sampling run, so the cached base weights stay untouched,
+# strength 0 gives exactly the base image, strength changes need no reload and
+# several LoRAs stack.
+
+def _read_lora(dit: IrisDiT, path: str, name: str, strength: float) -> dict:
+    """An Iris LoRA file ("<layer>.lora_down" / "<layer>.lora_up" with rank/alpha metadata)."""
+    with safe_open(path, framework="pt") as f:
+        raw = f.metadata() or {}
+    if "rank" not in raw or "alpha" not in raw:
+        raise ValueError(f"{name} is not an Iris LoRA (no rank/alpha metadata)")
+    meta = {"rank": int(raw["rank"]), "alpha": float(raw["alpha"]), **json.loads(raw.get("extra") or "{}")}
+    tensors = load_file(path)
+    layers = {}
+    for key in tensors:
+        if not key.endswith(".lora_down"):
+            continue
+        prefix = key[: -len(".lora_down")]
+        try:
+            linear = dit.get_submodule(prefix)
+        except AttributeError as exc:
+            raise ValueError(f"{name} targets {prefix}, which this Iris model lacks") from exc
+        if not isinstance(linear, torch.nn.Linear):
+            raise ValueError(f"{name}: {prefix} is not a Linear layer")
+        up = tensors[prefix + ".lora_up"]
+        if up.abs().max() == 0:
+            continue  # e.g. the all-zero adaLN-core pairs in the Turbo releases
+        layers[prefix] = (tensors[key], up)
+    return {"layers": layers, "scale": strength * meta["alpha"] / meta["rank"], "meta": meta, "name": name}
+
+
+def _read_aitoolkit_lora_live(dit: IrisDiT, path: str, name: str, strength: float) -> dict:
+    """An ai-toolkit LoRA as a live LoRA: PEFT keys renamed, rank inferred from the
+    tensors, alpha = rank (ai-toolkit forces peft format for transformer models)."""
+    tensors, rank = _read_aitoolkit_lora(dit, path, name)
+    layers = {}
+    for key, down in tensors.items():
+        if not key.endswith(".lora_down"):
+            continue
+        prefix = key[: -len(".lora_down")]
+        up = tensors[prefix + ".lora_up"]
+        if up.abs().max() == 0:
+            continue
+        layers[prefix] = (down, up)
+    meta = {"rank": rank, "alpha": float(rank)}
+    return {"layers": layers, "scale": strength, "meta": meta, "name": name}
+
+
+def _with_lora(model: "IrisModel", lora: dict) -> "IrisModel":
+    out = copy.copy(model)  # shares the cached DiT; LoRAs only apply inside the samplers
+    out.loras = [*model.loras, lora]
+    return out
+
+
+@contextmanager
+def _live_lora(model: "IrisModel", device):
+    """Adds the attached LoRAs to their Linear layers for the length of a run with forward
+    hooks, so the cached base weights are never modified and no second copy is made."""
+    handles = []
+    try:
+        for lora in model.loras:
+            scale = lora["scale"]
+            if scale == 0:
+                continue
+            for prefix, (down, up) in lora["layers"].items():
+                linear = model.model.get_submodule(prefix)
+                d = down.to(device, model.dtype)
+                u = (up * scale).to(device, model.dtype)
+
+                def hook(_module, args, out, d=d, u=u):
+                    return out + ((args[0].to(d.dtype) @ d.t()) @ u.t()).to(out.dtype)
+
+                handles.append(linear.register_forward_hook(hook))
+        yield
+    finally:
+        for h in handles:
+            h.remove()
 
 
 def _nbytes(module: torch.nn.Module) -> int:
@@ -355,6 +442,8 @@ class IrisModel:
         self.model, self.cfg, self.dtype, self.name = model, cfg, dtype, name
         self.turbo = turbo
         self.nbytes = _nbytes(model)
+        # [{"layers": {prefix: (down, up)}, "scale": float, "meta": dict}, ...] from the LoRA loaders
+        self.loras = []
 
 
 class IrisTextEncoder:
@@ -445,9 +534,10 @@ class IrisTurboLoRALoader:
 
 
 class IrisAIToolkitLoRA:
-    """Merge an ai-toolkit LoRA (arch: iris3b) into a loaded model, read directly:
+    """Attach an ai-toolkit LoRA (arch: iris3b) to a loaded model, read directly:
     its PEFT keys are renamed on load and the rank is inferred, no conversion step.
-    Works before or after a Turbo merge: both are plain Linear folds and commute."""
+    Applied live with forward hooks while sampling, so the base weights are never
+    modified, strength changes need no reload and several LoRAs stack."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -468,8 +558,39 @@ class IrisAIToolkitLoRA:
     CATEGORY = "Iris-3B"
 
     def load(self, model, lora_name, strength):
-        _merge_aitoolkit_lora(model.model, lora_name, strength)
-        return (model,)
+        lora = _read_aitoolkit_lora_live(model.model, _lora_path(lora_name), lora_name, strength)
+        log.info("attached ai-toolkit LoRA %s: %d layers, rank %d at strength %g",
+                 lora_name, len(lora["layers"]), lora["meta"]["rank"], strength)
+        return (_with_lora(model, lora),)
+
+
+class IrisLoRA:
+    """Attach an Iris LoRA (the official trainer's format, rank/alpha metadata) to a
+    loaded model, applied live with forward hooks: the base weights are never
+    modified, strength 0 gives exactly the base image and several LoRAs stack."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("IRIS_MODEL",),
+                "lora_name": (_iris_lora_files(), {
+                    "tooltip": "Iris LoRAs in models/loras, subfolders included (the official "
+                               "trainer's format, with rank/alpha metadata)"},),
+                "strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 3.0, "step": 0.05,
+                                       "tooltip": "1.0 is the trained strength"}),
+            }
+        }
+
+    RETURN_TYPES = ("IRIS_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "Iris-3B"
+
+    def load(self, model, lora_name, strength):
+        lora = _read_lora(model.model, _lora_path(lora_name), lora_name, strength)
+        log.info("attached Iris LoRA %s: %d layers, rank %s alpha %s at strength %g",
+                 lora_name, len(lora["layers"]), lora["meta"]["rank"], lora["meta"]["alpha"], strength)
+        return (_with_lora(model, lora),)
 
 
 class IrisTextEncoderLoader:
@@ -641,7 +762,7 @@ def run_sampler(model, conditioning, width, height, steps, cfg, seed, batch_size
     pbar = comfy.utils.ProgressBar(steps)
     autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
     try:
-        with autocast:
+        with autocast, _live_lora(model, device):
             # FlowDPMSolver.sample() with a per-step callback; x0 is already an image
             grid = solver.time_grid(total, shift)[-(steps + 1):]
             if img2img:
@@ -717,7 +838,7 @@ def run_turbo_sampler(model, conditioning, width, height, steps, seed, batch_siz
     pbar = comfy.utils.ProgressBar(len(times))
     autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
     try:
-        with autocast:
+        with autocast, _live_lora(model, device):
             for i, t_now in enumerate(times):
                 mm.throw_exception_if_processing_interrupted()
                 t = torch.full((batch_size,), t_now, device=device, dtype=torch.float32)
@@ -1299,6 +1420,7 @@ NODE_CLASS_MAPPINGS = {
     "IrisModelLoader": IrisModelLoader,
     "IrisTurboLoRALoader": IrisTurboLoRALoader,
     "IrisAIToolkitLoRA": IrisAIToolkitLoRA,
+    "IrisLoRA": IrisLoRA,
     "IrisTextEncoderLoader": IrisTextEncoderLoader,
     "IrisTextEncode": IrisTextEncode,
     "IrisTurboSampler": IrisTurboSampler,
@@ -1315,6 +1437,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IrisModelLoader": "Load Iris-3B Model",
     "IrisTurboLoRALoader": "Load Iris Turbo LoRA",
     "IrisAIToolkitLoRA": "Load Iris LoRA (ai-toolkit)",
+    "IrisLoRA": "Load Iris LoRA",
     "IrisTextEncoderLoader": "Load Iris Text Encoder (Qwen3-VL-4B)",
     "IrisTextEncode": "Iris Text Encode",
     "IrisTurboSampler": "Iris Turbo Sampler (4 steps)",
