@@ -447,7 +447,7 @@ class IrisTurboLoRALoader:
 class IrisAIToolkitLoRA:
     """Merge an ai-toolkit LoRA (arch: iris3b) into a loaded model, read directly:
     its PEFT keys are renamed on load and the rank is inferred, no conversion step.
-    Merge it before any Turbo LoRA: like the Turbo merge it is permanent."""
+    Works before or after a Turbo merge: both are plain Linear folds and commute."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -468,10 +468,6 @@ class IrisAIToolkitLoRA:
     CATEGORY = "Iris-3B"
 
     def load(self, model, lora_name, strength):
-        if model.turbo:
-            raise ValueError(
-                "this model already has a Turbo LoRA merged in: merge the ai-toolkit LoRA first, "
-                "then the Turbo one, or load the base model again.")
         _merge_aitoolkit_lora(model.model, lora_name, strength)
         return (model,)
 
